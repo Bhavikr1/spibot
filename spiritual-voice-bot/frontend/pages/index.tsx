@@ -44,24 +44,95 @@ export default function Home() {
       content: input,
       timestamp: new Date()
     };
+
+    const currentInput = input;
     setMessages(prev => [...prev, userMessage]);
     setInput('');
     setIsProcessing(true);
 
     try {
-      const response = await axios.post(`${API_URL}/api/text/query`, {
-        query: input,
-        language: language,
-        include_citations: true
+      // Prepare conversation history (last 6 messages for context)
+      const conversationHistory = messages.slice(-6).map(msg => ({
+        role: msg.role,
+        content: msg.content
+      }));
+
+      // Use streaming endpoint
+      const response = await fetch(`${API_URL}/api/text/query/stream`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: currentInput,
+          language: language,
+          include_citations: true,
+          conversation_history: conversationHistory
+        }),
       });
 
+      if (!response.ok) {
+        throw new Error('Failed to fetch response');
+      }
+
+      // Create assistant message placeholder
       const assistantMessage: Message = {
         role: 'assistant',
-        content: response.data.answer,
-        citations: response.data.citations,
+        content: '',
+        citations: [],
         timestamp: new Date()
       };
       setMessages(prev => [...prev, assistantMessage]);
+
+      // Read the streaming response with smooth animation
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+
+      if (reader) {
+        let accumulatedContent = '';
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value, { stream: true });
+          buffer += chunk;
+
+          // Process complete lines
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const content = line.slice(6).trim();
+              if (content && content !== '[DONE]' && !content.startsWith('[ERROR]')) {
+                // Parse JSON-encoded content (backend escapes newlines for SSE)
+                try {
+                  const decoded = JSON.parse(content);
+                  accumulatedContent += decoded;
+                } catch {
+                  // Fallback for non-JSON content
+                  accumulatedContent += content;
+                }
+
+                // Update the last message with accumulated content - smooth update
+                setMessages(prev => {
+                  const newMessages = [...prev];
+                  const lastMessage = newMessages[newMessages.length - 1];
+                  if (lastMessage && lastMessage.role === 'assistant') {
+                    lastMessage.content = accumulatedContent;
+                  }
+                  return newMessages;
+                });
+
+                // Small delay for smoother streaming effect
+                await new Promise(resolve => setTimeout(resolve, 10));
+              }
+            }
+          }
+        }
+      }
     } catch (error) {
       console.error('Error:', error);
       const errorMessage: Message = {
@@ -125,11 +196,13 @@ export default function Home() {
     setIsProcessing(true);
 
     try {
+      // Step 1: Send audio for transcription only
       const formData = new FormData();
       formData.append('audio', audioBlob, 'query.wav');
       formData.append('language', language);
 
-      const response = await axios.post(`${API_URL}/api/voice/query`, formData, {
+      // First, get transcription
+      const transcribeResponse = await axios.post(`${API_URL}/api/voice/query`, formData, {
         headers: {
           'Content-Type': 'multipart/form-data'
         },
@@ -137,8 +210,9 @@ export default function Home() {
       });
 
       // Get transcription from headers
-      const transcription = response.headers['x-transcription'] || 'Voice query';
+      const transcription = transcribeResponse.headers['x-transcription'] || 'Voice query';
 
+      // Show user's transcribed message
       const userMessage: Message = {
         role: 'user',
         content: transcription,
@@ -146,23 +220,92 @@ export default function Home() {
       };
       setMessages(prev => [...prev, userMessage]);
 
-      // Play audio response
-      const audioUrl = URL.createObjectURL(response.data);
+      // Step 2: Use streaming endpoint to get bot response
+      const conversationHistory = messages.slice(-6).map(msg => ({
+        role: msg.role,
+        content: msg.content
+      }));
+
+      const streamResponse = await fetch(`${API_URL}/api/text/query/stream`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: transcription,
+          language: language,
+          include_citations: true,
+          conversation_history: conversationHistory
+        }),
+      });
+
+      if (!streamResponse.ok) {
+        throw new Error('Failed to fetch response');
+      }
+
+      // Create assistant message placeholder
+      const assistantMessage: Message = {
+        role: 'assistant',
+        content: '',
+        citations: [],
+        timestamp: new Date()
+      };
+      setMessages(prev => [...prev, assistantMessage]);
+
+      // Read streaming response
+      const reader = streamResponse.body?.getReader();
+      const decoder = new TextDecoder();
+
+      if (reader) {
+        let accumulatedContent = '';
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value, { stream: true });
+          buffer += chunk;
+
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const content = line.slice(6).trim();
+              if (content && content !== '[DONE]' && !content.startsWith('[ERROR]')) {
+                // Parse JSON-encoded content (backend escapes newlines for SSE)
+                try {
+                  const decoded = JSON.parse(content);
+                  accumulatedContent += decoded;
+                } catch {
+                  // Fallback for non-JSON content
+                  accumulatedContent += content;
+                }
+
+                setMessages(prev => {
+                  const newMessages = [...prev];
+                  const lastMessage = newMessages[newMessages.length - 1];
+                  if (lastMessage && lastMessage.role === 'assistant') {
+                    lastMessage.content = accumulatedContent;
+                  }
+                  return newMessages;
+                });
+
+                await new Promise(resolve => setTimeout(resolve, 10));
+              }
+            }
+          }
+        }
+      }
+
+      // Step 3: Play audio response
+      const audioUrl = URL.createObjectURL(transcribeResponse.data);
       const audio = new Audio(audioUrl);
 
       setIsPlaying(true);
       audio.onended = () => setIsPlaying(false);
       await audio.play();
-
-      // Extract text from citations if available
-      const citations = response.headers['x-citations'];
-      const assistantMessage: Message = {
-        role: 'assistant',
-        content: 'Voice response (click to replay)',
-        citations: citations ? JSON.parse(citations) : [],
-        timestamp: new Date()
-      };
-      setMessages(prev => [...prev, assistantMessage]);
 
     } catch (error) {
       console.error('Error sending voice query:', error);
@@ -184,6 +327,22 @@ export default function Home() {
         <meta name="description" content="Voice-enabled spiritual companion based on Sanatan Dharma" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <link rel="icon" href="/favicon.ico" />
+        <style>{`
+          @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(5px); }
+            to { opacity: 1; transform: translateY(0); }
+          }
+          .message-content {
+            animation: fadeIn 0.3s ease-in;
+            white-space: pre-line;
+            line-height: 1.6;
+          }
+          .streaming-text {
+            animation: fadeIn 0.2s ease-in;
+            white-space: pre-line;
+            line-height: 1.6;
+          }
+        `}</style>
       </Head>
 
       <main className="min-h-screen bg-gradient-to-br from-orange-50 via-white to-amber-50">
@@ -219,18 +378,18 @@ export default function Home() {
                 <BookOpen className="w-10 h-10 text-white" />
               </div>
               <h2 className="text-2xl font-bold text-gray-900 mb-2">
-                Welcome, Seeker
+                Welcome! I'm here to listen
               </h2>
-              <p className="text-gray-600 mb-4">
-                Ask me anything about Sanatan Dharma scriptures
+              <p className="text-gray-600 mb-4 max-w-lg mx-auto">
+                I'm your spiritual companion. Share what's on your mind - whether it's stress, confusion, or just curiosity about life's deeper questions. I'll listen, understand, and share wisdom from Sanatan Dharma that speaks to your situation.
               </p>
               <div className="max-w-md mx-auto text-left bg-white rounded-lg p-4 shadow-sm">
-                <p className="text-sm text-gray-700 mb-2 font-semibold">Example questions:</p>
+                <p className="text-sm text-gray-700 mb-2 font-semibold">You can simply say:</p>
                 <ul className="text-sm text-gray-600 space-y-1">
-                  <li>• What does the Bhagavad Gita say about controlling the mind?</li>
-                  <li>• How can I deal with stress according to Hindu philosophy?</li>
-                  <li>• What is Karma Yoga?</li>
-                  <li>• Tell me about the nature of the soul</li>
+                  <li>• "I'm feeling really stressed lately"</li>
+                  <li>• "I'm struggling with my relationships"</li>
+                  <li>• "I feel lost and don't know my purpose"</li>
+                  <li>• "I have trouble controlling my mind"</li>
                 </ul>
               </div>
             </div>
@@ -248,7 +407,9 @@ export default function Home() {
                         : 'bg-white shadow-sm border border-orange-100'
                     }`}
                   >
-                    <p className="whitespace-pre-wrap">{message.content}</p>
+                    <p className={`whitespace-pre-wrap ${isProcessing && index === messages.length - 1 ? 'streaming-text' : 'message-content'}`}>
+                      {message.content || (isProcessing && index === messages.length - 1 ? '...' : '')}
+                    </p>
 
                     {message.citations && message.citations.length > 0 && (
                       <div className="mt-3 pt-3 border-t border-orange-200">

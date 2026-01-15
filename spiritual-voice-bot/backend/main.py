@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 import io
+import json
 import logging
 
 from config import settings
@@ -14,6 +15,7 @@ from rag.pipeline import RAGPipeline
 from voice.asr import ASRProcessor
 from voice.tts import TTSProcessor
 from llm.service import get_llm_service
+from llm.formatter import get_refiner, get_reformatter
 
 # Setup logging
 logging.basicConfig(
@@ -36,6 +38,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Transcription", "X-Citations"]  # Expose custom headers
 )
 
 # Initialize components
@@ -49,6 +52,7 @@ class TextQuery(BaseModel):
     query: str
     language: str = "en"
     include_citations: bool = True
+    conversation_history: Optional[List[dict]] = None
 
 
 class TextResponse(BaseModel):
@@ -93,9 +97,25 @@ async def startup_event():
         logger.info("Initializing LLM Service...")
         llm_service = get_llm_service()
         if llm_service.available:
-            logger.info("LLM Service initialized successfully with Claude")
+            logger.info("LLM Service initialized successfully with Gemini")
         else:
-            logger.warning("LLM Service not available - will use fallback templates. Set ANTHROPIC_API_KEY to enable.")
+            logger.warning("LLM Service not available - will use fallback templates. Set GEMINI_API_KEY to enable.")
+
+        # Initialize Query Refiner
+        logger.info("Initializing Query Refiner...")
+        refiner = get_refiner(settings.GEMINI_API_KEY)
+        if refiner and refiner.available:
+            logger.info("Query Refiner initialized successfully")
+        else:
+            logger.warning("Query Refiner not available")
+
+        # Initialize Response Reformatter
+        logger.info("Initializing Response Reformatter...")
+        reformatter = get_reformatter(settings.GEMINI_API_KEY)
+        if reformatter and reformatter.available:
+            logger.info("Response Reformatter initialized successfully")
+        else:
+            logger.warning("Response Reformatter not available")
 
         logger.info("All components initialized successfully!")
 
@@ -144,11 +164,12 @@ async def text_query(query: TextQuery):
 
         logger.info(f"Processing text query: {query.query[:50]}...")
 
-        # Get response from RAG pipeline
+        # Get response from RAG pipeline with conversation history
         result = await rag_pipeline.query(
             query=query.query,
             language=query.language,
-            include_citations=query.include_citations
+            include_citations=query.include_citations,
+            conversation_history=query.conversation_history
         )
 
         return TextResponse(
@@ -160,6 +181,53 @@ async def text_query(query: TextQuery):
 
     except Exception as e:
         logger.error(f"Error processing text query: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/text/query/stream")
+async def text_query_stream(query: TextQuery):
+    """
+    Process text query and return streaming text response
+    """
+    try:
+        if not rag_pipeline:
+            raise HTTPException(status_code=500, detail="RAG pipeline not initialized")
+
+        logger.info(f"Processing streaming text query: {query.query[:50]}...")
+
+        async def generate_stream():
+            try:
+                # Stream response from RAG pipeline with conversation history
+                async for chunk in rag_pipeline.query_stream(
+                    query=query.query,
+                    language=query.language,
+                    include_citations=query.include_citations,
+                    conversation_history=query.conversation_history
+                ):
+                    # For SSE format, we need to escape newlines in the chunk
+                    # because \n\n terminates an SSE event
+                    # Replace actual newlines with escaped newlines for JSON compatibility
+                    import json
+                    # JSON encode the chunk to escape special characters
+                    chunk_escaped = json.dumps(chunk)
+                    # Send as Server-Sent Events format
+                    yield f"data: {chunk_escaped}\n\n"
+            except Exception as e:
+                logger.error(f"Error in stream generation: {str(e)}")
+                yield f"data: [ERROR] {str(e)}\n\n"
+
+        return StreamingResponse(
+            generate_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error processing streaming text query: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

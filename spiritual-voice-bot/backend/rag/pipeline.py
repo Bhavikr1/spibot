@@ -4,6 +4,7 @@ RAG Pipeline for Scripture-grounded responses with LLM integration
 import numpy as np
 from typing import List, Dict, Optional
 from llm.service import get_llm_service
+from llm.formatter import get_refiner, get_reformatter, ensure_paragraph_breaks
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -385,24 +386,25 @@ class RAGPipeline:
 
         logger.info(f"Processing query: {query[:100]}...")
 
+        # Optionally refine query for better RAG retrieval
+        search_query = query
+        refiner = get_refiner()
+        if refiner and refiner.available:
+            logger.info("Refining query for better scripture search...")
+            search_query = await refiner.refine_query(query, language)
+            logger.info(f"Refined query: '{search_query}'")
+
         # Retrieve relevant passages
         retrieved_docs = await self.search(
-            query=query,
+            query=search_query,
             language=language,
             top_k=settings.RETRIEVAL_TOP_K
         )
 
+        # Even if no documents retrieved, we can still have a conversation
+        # The LLM will provide empathetic guidance without scripture citations
         if not retrieved_docs:
-            if language == "hi":
-                no_result_msg = "क्षमा करें, मुझे आपके प्रश्न के लिए कोई प्रासंगिक शास्त्र नहीं मिला। कृपया अपने प्रश्न को दूसरे तरीके से पूछें।"
-            else:
-                no_result_msg = "I couldn't find a specific scripture for your question. Could you try rephrasing it?"
-
-            return {
-                "answer": no_result_msg,
-                "citations": [],
-                "confidence": 0.0
-            }
+            logger.info("No documents retrieved, but continuing conversation without scripture context")
 
         # Get LLM service
         llm_service = get_llm_service()
@@ -427,16 +429,117 @@ class RAGPipeline:
                 "score": doc["score"]
             }
             for doc in retrieved_docs
-        ] if include_citations else []
+        ] if include_citations and retrieved_docs else []
 
         # Calculate confidence
-        avg_score = np.mean([doc["score"] for doc in retrieved_docs])
+        if retrieved_docs:
+            avg_score = np.mean([doc["score"] for doc in retrieved_docs])
+        else:
+            avg_score = 0.0
 
         return {
             "answer": answer,
             "citations": citations,
             "confidence": float(avg_score)
         }
+
+    async def query_stream(
+        self,
+        query: str,
+        language: str = "en",
+        include_citations: bool = True,
+        conversation_history: Optional[List[Dict]] = None
+    ):
+        """
+        Process query and generate streaming response with citations using LLM
+        Yields chunks of text as they're generated
+        """
+        if not self.initialized:
+            raise RuntimeError("Pipeline not initialized")
+
+        logger.info(f"Processing streaming query: {query[:100]}...")
+
+        # Optionally refine query for better RAG retrieval
+        search_query = query
+        refiner = get_refiner()
+        if refiner and refiner.available:
+            logger.info("Refining query for better scripture search...")
+            search_query = await refiner.refine_query(query, language)
+            logger.info(f"Refined query: '{search_query}'")
+
+        # Retrieve relevant passages
+        retrieved_docs = await self.search(
+            query=search_query,
+            language=language,
+            top_k=settings.RETRIEVAL_TOP_K
+        )
+
+        # Even if no documents retrieved in streaming, continue conversation
+        if not retrieved_docs:
+            logger.info("No documents retrieved in streaming, but continuing conversation without scripture context")
+
+        # Get LLM service
+        llm_service = get_llm_service()
+
+        # Generate streaming response using LLM with retrieved context
+        logger.info("Generating streaming response with LLM...")
+
+        # Collect the full response first
+        full_response = ""
+        async for chunk in llm_service.generate_response_stream(
+            query=query,
+            context_docs=retrieved_docs,
+            language=language,
+            conversation_history=conversation_history
+        ):
+            full_response += chunk
+
+        # Use Gemini reformatter to completely rebuild the response
+        logger.info(f"Reformulating response. Original: {len(full_response)} chars, Docs retrieved: {len(retrieved_docs)}")
+        reformatter = get_reformatter(settings.GEMINI_API_KEY)
+
+        if reformatter and reformatter.available:
+            # Build context string for reformatter
+            context_verses = self._build_verse_context(retrieved_docs)
+            logger.info(f"Context verses built: {context_verses[:300]}...")
+
+            # Reformulate using Gemini
+            reformulated_response = await reformatter.reformulate_response(
+                original_response=full_response,
+                user_query=query,
+                context_verses=context_verses
+            )
+            logger.info(f"✅ Reformulated! Length: {len(reformulated_response)} chars")
+
+            yield reformulated_response
+        else:
+            # Fallback to simple formatting if reformatter not available
+            logger.error("❌ Reformatter NOT available! Using fallback")
+            formatted_response = ensure_paragraph_breaks(full_response)
+            yield formatted_response
+
+    def _build_verse_context(self, docs: List[Dict]) -> str:
+        """
+        Build a formatted context string with verse information for reformatter
+
+        Args:
+            docs: Retrieved documents with verses
+
+        Returns:
+            Formatted string with verse information
+        """
+        if not docs:
+            return "No specific verses available."
+
+        verses = []
+        for i, doc in enumerate(docs[:3], 1):  # Top 3 verses
+            verse_text = f"""Verse {i}:
+- Reference: {doc.get('scripture', 'Bhagavad Gita')} Chapter {doc.get('chapter', '?')}, Verse {doc.get('verse', '?')}
+- Text: "{doc.get('text', '')}"
+- Topic: {doc.get('topic', 'General wisdom')}"""
+            verses.append(verse_text)
+
+        return "\n\n".join(verses)
 
     def _generate_response(
         self,
