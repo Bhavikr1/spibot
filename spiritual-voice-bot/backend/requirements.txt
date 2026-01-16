@@ -1,53 +1,31 @@
 # Core Framework
-fastapi
-uvicorn[standard]
-pydantic
-pydantic-settings
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.5.2
 
-# LLM & AI
-google-generativeai
-transformers
-torch
-accelerate
-bitsandbytes
-sentence-transformers
-langchain
-langchain-community
+# LLM & AI - ONLY Google Gemini (actually used)
+google-generativeai==0.8.3
 
-# RAG & Vector DB
-qdrant-client
-chromadb
-faiss-cpu
+# Embeddings - ONLY sentence-transformers (actually used)
+sentence-transformers==3.2.1
 
-# Voice Processing
-openai-whisper
-TTS
-gtts
-soundfile
-librosa
-pydub
+# Text Processing - ONLY langchain basics (actually used)
+langchain==0.3.7
+langchain-community==0.3.5
 
-# Indic NLP
-indic-nlp-library
-ai4bharat-transliteration
+# Voice Processing - ONLY what's used
+openai-whisper==20240930
+gtts==2.5.3
+pydub==0.25.1
 
-# Data Processing
-pandas
-numpy
-datasets
+# Data Processing - Core only
+numpy==1.26.4
 
 # Utilities
-python-multipart
-aiofiles
-python-dotenv
-httpx
-pyyaml
-redis
+python-multipart==0.0.12
+aiofiles==24.1.0
+python-dotenv==1.0.1
 
-# Monitoring & Logging
-loguru
-prometheus-client
-
-# Testing
-pytest
-pytest-asyncio
+# Logging
+loguru==0.7.2
